@@ -1,0 +1,149 @@
+# .github/workflows/terraform.yml
+# ============================================================
+# GitHub Actions Pipeline — Terraform IaC (Додаткове завдання)
+# Виконує: init → validate → plan → apply (або destroy)
+# ============================================================
+
+name: Terraform CI/CD
+
+on:
+  push:
+    branches:
+      - main        # apply при push у main
+    paths:
+      - "*.tf"      # тільки якщо змінились .tf файли
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches:
+      - main        # тільки plan при PR (без apply)
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Дія Terraform"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+# Дозволяємо тільки один запуск одночасно (захист від race condition)
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    name: Terraform ${{ github.event.inputs.action || (github.event_name == 'pull_request' && 'plan') || 'apply' }}
+    runs-on: ubuntu-latest
+
+    # Дозвіл на запис (потрібно для PR коментарів)
+    permissions:
+      contents: read
+      pull-requests: write
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # ── 1. Клонуємо репозиторій ──────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Налаштовуємо Terraform ────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      # ── 3. Конфігуруємо AWS credentials (з GitHub Secrets) ──
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      # ── 4. terraform init ─────────────────────────────────
+      - name: Terraform Init
+        id: init
+        run: terraform init
+
+      # ── 5. terraform validate ─────────────────────────────
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      # ── 6. terraform plan (завжди) ────────────────────────
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var="key_name=${{ secrets.EC2_KEY_NAME }}" \
+            -no-color \
+            -out=tfplan
+        continue-on-error: true   # план може провалитись — показуємо помилку в PR
+
+      # ── 7. Коментар до Pull Request з результатом plan ───
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `### 🔍 Terraform Plan результат
+
+            **Init:** \`${{ steps.init.outcome }}\`
+            **Validate:** \`${{ steps.validate.outcome }}\`
+            **Plan:** \`${{ steps.plan.outcome }}\`
+
+            <details><summary>Деталі плану</summary>
+
+            \`\`\`
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            </details>
+
+            *Запущено: \`${{ github.actor }}\`, подія: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      # ── 8. Зупиняємо якщо plan провалився ────────────────
+      - name: Check Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      # ── 9. terraform apply (тільки push у main або ручний запуск з action=apply) ──
+      - name: Terraform Apply
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: |
+          terraform apply \
+            -var="key_name=${{ secrets.EC2_KEY_NAME }}" \
+            -auto-approve \
+            -input=false \
+            tfplan
+
+      # ── 10. terraform destroy (тільки ручний запуск з action=destroy) ──
+      - name: Terraform Destroy
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+        run: |
+          terraform destroy \
+            -var="key_name=${{ secrets.EC2_KEY_NAME }}" \
+            -auto-approve \
+            -input=false
+
+      # ── 11. Виводимо outputs після apply ─────────────────
+      - name: Terraform Output
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: terraform output
